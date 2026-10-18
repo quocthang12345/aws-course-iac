@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Course IaC capstone - API serverless (HTTP API + Lambda + DynamoDB)
+
+Parameters:
+  BoundaryArn:
+    Type: String
+    AllowedPattern: '^arn:aws:iam::\d{12}:policy/[A-Za-z0-9+=,.@_/-]+$'
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+
+  HitsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      PermissionsBoundary: !Ref BoundaryArn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          APP_VERSION: v1
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt Table.Arn
+      Events:
+        GetHits:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /hits
+            Method: GET
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/hits'
+  FunctionName:
+    Value: !Ref HitsFunction
+  TableName:
+    Value: !Ref Table
