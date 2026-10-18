@@ -27,5 +27,5 @@ def handler(event, context):
     return {
         "statusCode": 200,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({"hits": hits, "version": os.environ.get("APP_VERSION", "v1")}),
+        "body": json.dumps({"hits": hits, "version": os.environ.get("APP_VERSION", "v2")}),
     }
