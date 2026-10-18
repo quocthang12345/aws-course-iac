@@ -1,0 +1,119 @@
+name: IaC pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: course-cap
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: course-cap
+  ARTIFACT_BUCKET: course-cap-artifacts-217512201638
+  BOUNDARY_ARN: arn:aws:iam::217512201638:policy/course-cap-boundary
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      changeset: ${{ steps.cs.outputs.name }}
+      type: ${{ steps.cs.outputs.type }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Unit tests (cong chan 1)
+        run: python -m unittest discover -s tests -v
+
+      - name: Lint template (cong chan 2)
+        run: |
+          pip install cfn-lint
+          cfn-lint template.yaml
+
+      - uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::217512201638:role/course-cap-planner
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build
+        run: sam build
+
+      - name: Package (upload code to S3)
+        run: sam package --s3-bucket "$ARTIFACT_BUCKET" --output-template-file packaged.yaml
+
+      - name: Create change set (NOT executed)
+        id: cs
+        run: |
+          NAME="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          if [ "$STATUS" = "NONE" ] || [ "$STATUS" = "REVIEW_IN_PROGRESS" ]; then TYPE=CREATE; else TYPE=UPDATE; fi
+          aws cloudformation create-change-set --stack-name "$STACK_NAME" --change-set-name "$NAME" \
+            --change-set-type "$TYPE" --template-body file://packaged.yaml \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --parameters ParameterKey=BoundaryArn,ParameterValue="$BOUNDARY_ARN" \
+            --tags Key=course,Value=aws-iac
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "$STACK_NAME" --change-set-name "$NAME" || true
+          CSTATUS=$(aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+            --change-set-name "$NAME" --query Status --output text)
+          if [ "$CSTATUS" != "CREATE_COMPLETE" ]; then
+            aws cloudformation describe-change-set --stack-name "$STACK_NAME" --change-set-name "$NAME" \
+              --query StatusReason --output text
+            aws cloudformation delete-change-set --stack-name "$STACK_NAME" --change-set-name "$NAME"
+            echo "name=NONE" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          fi
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+
+      - name: Show planned changes
+        if: steps.cs.outputs.name != 'NONE'
+        run: |
+          aws cloudformation describe-change-set --stack-name "$STACK_NAME" \
+            --change-set-name "${{ steps.cs.outputs.name }}" \
+            --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' \
+            --output table
+
+  deploy:
+    needs: plan
+    if: github.event_name == 'push' && needs.plan.outputs.changeset != 'NONE'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::217512201638:role/course-cap-deployer
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Execute the SAME change set that was reviewed
+        run: |
+          aws cloudformation execute-change-set --stack-name "$STACK_NAME" \
+            --change-set-name "${{ needs.plan.outputs.changeset }}"
+          if [ "${{ needs.plan.outputs.type }}" = "CREATE" ]; then
+            aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+          else
+            aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME"
+          fi
+
+      - name: Smoke test
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          sleep 5
+          curl -fsS "$URL"
